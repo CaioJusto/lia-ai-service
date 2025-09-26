@@ -6,7 +6,12 @@ from datetime import datetime
 
 from fastapi import APIRouter
 
-from ..services.ai_service import get_lia_agent, get_openai_client, stream_progress
+from ..services.ai_service import (
+    get_ai_capabilities_status,
+    get_lia_agent,
+    get_openai_client,
+    stream_progress,
+)
 from ..services.database_service import (
     conversation_cache,
     env_requirements,
@@ -41,6 +46,13 @@ async def health_check():
         "env_missing": env_missing,
         "timestamp": datetime.now().isoformat(),
     }
+
+
+@router.get("/health/services")
+async def services_health_check():
+    status = get_ai_capabilities_status()
+    status["timestamp"] = datetime.now().isoformat()
+    return status
 
 
 @router.get("/mobile-test")

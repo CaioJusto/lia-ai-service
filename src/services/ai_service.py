@@ -54,6 +54,81 @@ multi_agent_generator: Optional[MultiAgentFlashcardGenerator] = None
 
 progress_store: Dict[str, "ProgressTracker"] = {}
 
+MAX_CHAT_HISTORY_MESSAGES = 10
+MAX_IMAGE_ATTACHMENTS = 3
+MAX_IMAGE_PAYLOAD_SIZE = 4_000_000  # ~4MB em caracteres base64/data URL
+
+
+def _sanitize_images(images: Optional[List[str]]) -> List[str]:
+    if not images:
+        return []
+
+    sanitized: List[str] = []
+    for image in images:
+        if not isinstance(image, str):
+            continue
+        if len(image) > MAX_IMAGE_PAYLOAD_SIZE:
+            continue
+        if image.startswith("data:image/") or image.startswith("http"):
+            sanitized.append(image)
+        if len(sanitized) >= MAX_IMAGE_ATTACHMENTS:
+            break
+    return sanitized
+
+
+def _serialize_message_content(text: str, images: Optional[List[str]] = None) -> str:
+    cleaned_text = text or ""
+    sanitized_images = _sanitize_images(images)
+    if sanitized_images:
+        payload = {"text": cleaned_text, "images": sanitized_images}
+        try:
+            return json.dumps(payload, ensure_ascii=False)
+        except TypeError:
+            return cleaned_text
+    return cleaned_text
+
+
+def _parse_message_payload(raw_content: Any) -> Dict[str, Any]:
+    if isinstance(raw_content, dict):
+        text = raw_content.get("text", "")
+        images = raw_content.get("images", [])
+        if isinstance(images, list):
+            images = _sanitize_images(images)
+        else:
+            images = []
+        return {"text": text, "images": images}
+
+    if isinstance(raw_content, str):
+        try:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, dict):
+                return _parse_message_payload(parsed)
+        except json.JSONDecodeError:
+            pass
+        return {"text": raw_content, "images": []}
+
+    return {"text": "", "images": []}
+
+
+def _build_openai_message(role: str, raw_content: Any) -> Dict[str, Any]:
+    parsed = _parse_message_payload(raw_content)
+    text = parsed.get("text", "")
+    images = parsed.get("images", [])
+
+    parts: List[Dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for image in images:
+        parts.append({"type": "image_url", "image_url": {"url": image}})
+
+    if not parts:
+        parts.append({"type": "text", "text": ""})
+
+    if len(parts) == 1 and parts[0]["type"] == "text":
+        return {"role": role, "content": parts[0]["text"]}
+
+    return {"role": role, "content": parts}
+
 
 def _extract_json_array(raw_text: str) -> Optional[List[Any]]:
     try:
@@ -209,9 +284,10 @@ def create_personalized_system_prompt(user_profile: Optional[Dict[str, Any]] = N
     - Celebra conquistas
 
     ⚠️ Regras de chat e concisão:
-    - Responda de forma curta e direta (até ~120–180 palavras ou 3–6 frases)
+    - Mantenha respostas objetivas (em média 120–160 palavras ou 4–6 frases)
     - Prefira parágrafos curtos e listas com bullets quando fizer sentido
     - Evite "paredes de texto"; se o assunto for amplo, peça esclarecimentos antes de expandir
+    - Se precisar aprofundar, dê um resumo primeiro e ofereça detalhes extras mediante pedido
     - Termine com 1 pergunta curta para continuar a conversa quando apropriado
     - Se o usuário pedir mais detalhes, aí sim aprofunde
     """
@@ -275,28 +351,43 @@ def create_personalized_system_prompt(user_profile: Optional[Dict[str, Any]] = N
     return base_prompt + personalization + "\nResponda sempre em português brasileiro!"
 
 
-async def chat_with_lia(message: str, conversation_id: str, user_id: str) -> str:
+async def chat_with_lia(
+    message: str,
+    conversation_id: str,
+    user_id: str,
+    images: Optional[List[str]] = None,
+) -> str:
     user_profile = await get_user_profile(user_id)
     system_prompt = create_personalized_system_prompt(user_profile)
 
     await ensure_conversation_exists(conversation_id, user_id)
     conversation_history = await get_conversation_history(conversation_id, user_id)
 
-    user_message_id = f"user_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
-    await save_message_to_db(conversation_id, user_id, "user", message, user_message_id)
+    sanitized_images = _sanitize_images(images)
+    serialized_user_content = _serialize_message_content(message, sanitized_images)
 
-    conversation_history.append({"role": "user", "content": message})
+    user_message_id = f"user_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
+    await save_message_to_db(
+        conversation_id,
+        user_id,
+        "user",
+        serialized_user_content,
+        user_message_id,
+    )
+
+    conversation_history.append({"role": "user", "content": serialized_user_content})
 
     messages = [{"role": "system", "content": system_prompt}]
-    recent_history = conversation_history[-10:]
-    messages.extend(recent_history)
+    recent_history = conversation_history[-MAX_CHAT_HISTORY_MESSAGES:]
+    for item in recent_history:
+        messages.append(_build_openai_message(item.get("role", "user"), item.get("content")))
 
     try:
         if is_openai_configured():
             response = await create_chat_completion(
                 messages,
                 temperature=0.6,
-                max_tokens=350,
+                max_tokens=320,
                 frequency_penalty=0.2,
             )
             lia_response = response.choices[0].message.content
@@ -314,7 +405,7 @@ async def chat_with_lia(message: str, conversation_id: str, user_id: str) -> str
         cache_key = f"{user_id}_{conversation_id}"
         if cache_key not in conversation_cache:
             conversation_cache[cache_key] = []
-        conversation_cache[cache_key].append({"role": "user", "content": message})
+        conversation_cache[cache_key].append({"role": "user", "content": serialized_user_content})
         conversation_cache[cache_key].append({"role": "assistant", "content": lia_response})
         if len(conversation_cache[cache_key]) > 20:
             conversation_cache[cache_key] = conversation_cache[cache_key][-20:]
@@ -866,10 +957,42 @@ async def stream_progress(operation_id: str):
     )
 
 
+def get_ai_capabilities_status() -> Dict[str, Any]:
+    env_status = env_requirements()
+    openai_ready = is_openai_configured()
+    supabase_ready = get_supabase_client() is not None
+    agent = get_lia_agent()
+    generator = get_multi_agent_generator()
+
+    capabilities = {
+        "chat_basic": openai_ready,
+        "chat_multimodal": openai_ready,
+        "chat_advanced": agent is not None,
+        "flashcards_multi_agent": generator is not None,
+        "flashcards_single_agent": agent is not None,
+        "notes": agent is not None,
+        "quiz": agent is not None,
+        "study_plan": agent is not None and supabase_ready,
+    }
+
+    return {
+        "status": "healthy"
+        if openai_ready and supabase_ready
+        else "degraded",
+        "openai_configured": openai_ready,
+        "supabase_configured": supabase_ready,
+        "env_requirements": env_status,
+        "capabilities": capabilities,
+    }
+
+
 async def handle_chat(request: ChatMessage) -> ChatResponse:
     try:
         response_text = await chat_with_lia(
-            request.message, request.conversation_id, request.user_id
+            request.message,
+            request.conversation_id,
+            request.user_id,
+            request.images,
         )
         return ChatResponse(
             success=True,
@@ -892,7 +1015,26 @@ async def handle_advanced_chat(request: ChatMessage) -> Dict[str, Any]:
         agent = get_lia_agent()
         if not agent:
             response_text = await chat_with_lia(
-                request.message, request.conversation_id, request.user_id
+                request.message,
+                request.conversation_id,
+                request.user_id,
+                request.images,
+            )
+            return {
+                "success": True,
+                "response": response_text,
+                "conversation_id": request.conversation_id,
+                "thread_id": request.conversation_id,
+                "agent_used": False,
+                "message_id": f"lia_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}",
+            }
+
+        if request.images:
+            response_text = await chat_with_lia(
+                request.message,
+                request.conversation_id,
+                request.user_id,
+                request.images,
             )
             return {
                 "success": True,

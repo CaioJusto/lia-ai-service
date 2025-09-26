@@ -11,6 +11,10 @@ class ChatMessage(BaseModel):
     message: str = Field(..., description="Mensagem enviada pelo usuário")
     conversation_id: str = Field(..., description="Identificador da conversa")
     user_id: str = Field(..., description="Identificador do usuário")
+    images: List[str] = Field(
+        default_factory=list,
+        description="Lista de imagens (URLs ou data URLs base64) que acompanham a mensagem",
+    )
 
 
 class UserProfile(BaseModel):
